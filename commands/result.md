@@ -1,7 +1,6 @@
 ---
 description: Show the stored output for an agy job in this repository
 argument-hint: '[job-id]'
-disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

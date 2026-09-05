@@ -1,7 +1,6 @@
 ---
 description: Show active and recent agy jobs for this repository
 argument-hint: '[job-id]'
-disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 

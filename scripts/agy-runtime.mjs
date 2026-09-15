@@ -63,7 +63,7 @@ function firstNonFlag(args) {
 
 // ---- exec ----------------------------------------------------------------
 function parseExec(args) {
-  const o = { background: true, resume: false, fresh: false, model: null, addDirs: [], timeout: '85m', task: [] };
+  const o = { background: true, resume: false, fresh: false, model: null, addDirs: [], timeout: '85m', quotaCheck: true, task: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--background') o.background = true;
@@ -73,6 +73,7 @@ function parseExec(args) {
     else if (a === '--model') o.model = args[++i];
     else if (a === '--add-dir') o.addDirs.push(args[++i]);
     else if (a === '--timeout') o.timeout = args[++i];
+    else if (a === '--no-quota-check') o.quotaCheck = false;
     else o.task.push(a);
   }
   o.task = o.task.join(' ').trim();
@@ -99,6 +100,19 @@ function cmdExec(args) {
   const { root, dir } = baseDir();
   const o = parseExec(args);
   if (!o.task) { console.log('No task text provided. Usage: exec [flags] <task...>'); process.exit(1); }
+
+  // An exhausted agy exits 0 with near-empty output, which reads as "ran but did
+  // nothing". Catch it here instead of letting the job look like a silent success.
+  if (o.quotaCheck) {
+    const q = fetchQuota();
+    if (q.ok && q.verdict === 'exhausted') {
+      console.log('agy is out of quota — every model group is spent. Not dispatching.');
+      console.log('');
+      printQuotaTable(q);
+      console.log('\nWait for the next reset above, use another executor, or re-run with --no-quota-check.');
+      process.exit(1);
+    }
+  }
 
   const jobId = newJobId();
   const jobDir = join(dir, 'jobs', jobId);
@@ -199,26 +213,123 @@ function cmdCancel(args) {
   console.log(`Cancelled job ${j.jobId} (pid ${j.pid}).`);
 }
 
+// ---- quota ---------------------------------------------------------------
+// agy exposes real quota through its own `/quota` slash command, which is
+// expanded in print mode and costs zero model tokens (usage.total_tokens == 0).
+// `--output-format json` wraps it as { command: { data: { groups: [...] } } }.
+function extractJson(text) {
+  const s = text.indexOf('{');
+  const e = text.lastIndexOf('}');
+  if (s === -1 || e <= s) return null;
+  try { return JSON.parse(text.slice(s, e + 1)); } catch { return null; }
+}
+
+function fetchQuota() {
+  const res = spawnSync(AGY_BIN, ['--print=/quota', '--output-format', 'json', '--print-timeout', '1m'], {
+    encoding: 'utf8', timeout: 120000, maxBuffer: 1e7,
+  });
+  if (res.error) return { ok: false, error: res.error.message, raw: '' };
+  const raw = `${res.stdout || ''}${res.stderr || ''}`;
+  const parsed = extractJson(raw);
+  const groups = parsed?.command?.data?.groups;
+  if (!Array.isArray(groups) || groups.length === 0) {
+    // Older agy builds print the plain TSV without the structured command payload.
+    return { ok: false, error: 'could not parse a quota payload from agy', raw };
+  }
+  const norm = groups.map((g) => ({
+    name: g.name,
+    description: g.description || '',
+    buckets: (g.buckets || []).map((b) => ({
+      id: b.id,
+      name: b.name,
+      window: b.window,
+      remainingFraction: typeof b.remaining_fraction === 'number' ? b.remaining_fraction : null,
+      resetTime: b.reset_time || null,
+      detail: b.description || '',
+    })),
+  }));
+  const spent = (g) => g.buckets.some((b) => b.remainingFraction === 0);
+  const verdict = norm.every(spent) ? 'exhausted' : (norm.some(spent) ? 'partial' : 'ok');
+  return { ok: true, verdict, groups: norm, note: parsed?.command?.data?.description || '' };
+}
+
+function untilText(iso) {
+  const t = Date.parse(iso || '');
+  if (!Number.isFinite(t)) return '-';
+  let s = Math.max(0, Math.round((t - Date.now()) / 1000));
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (!d && m) parts.push(`${m}m`);
+  return parts.length ? `in ${parts.join(' ')}` : 'now';
+}
+
+function pct(f) {
+  if (f === null) return '-';
+  const v = f * 100;
+  return `${v >= 99.95 ? '100' : v.toFixed(1)}%`;
+}
+
+function printQuotaTable(q) {
+  console.log('| group | window | remaining | resets |');
+  console.log('|---|---|---|---|');
+  for (const g of q.groups) {
+    for (const b of g.buckets) {
+      const reset = b.resetTime ? `${untilText(b.resetTime)} (${new Date(b.resetTime).toLocaleString()})` : '-';
+      console.log(`| ${g.name} | ${b.window || b.name} | ${pct(b.remainingFraction)} | ${reset} |`);
+    }
+  }
+}
+
+function cmdQuota(args) {
+  const q = fetchQuota();
+  if (args.includes('--json')) { console.log(JSON.stringify(q, null, 2)); return; }
+  if (!q.ok) {
+    console.log(`Could not read agy quota: ${q.error}`);
+    if (q.raw) { console.log('--- agy output ---'); console.log(q.raw.slice(0, 800)); }
+    process.exit(1);
+  }
+  console.log(`agy quota — verdict: ${q.verdict}`);
+  console.log('');
+  printQuotaTable(q);
+  for (const g of q.groups) {
+    if (g.description) console.log(`\n${g.name}: ${g.description}`);
+  }
+  if (q.note) console.log(`\n${q.note}`);
+}
+
 // ---- setup ---------------------------------------------------------------
 function cmdSetup(args) {
   const json = args.includes('--json');
   const which = spawnSync('sh', ['-c', `command -v ${AGY_BIN}`], { encoding: 'utf8' });
   const installed = which.status === 0 && which.stdout.trim().length > 0;
-  let quota = 'unknown';
-  let detail = '';
-  if (installed) {
-    const ping = spawnSync(AGY_BIN, ['--print=Reply one word: ok', '--dangerously-skip-permissions'], { encoding: 'utf8', timeout: 300000, maxBuffer: 1e7 });
-    detail = `${ping.stdout || ''}${ping.stderr || ''}`;
-    if (/quota reached|usage limit/i.test(detail)) quota = 'exhausted';
-    else if (ping.status === 0) quota = 'ok';
-    else quota = 'error';
+  const q = installed ? fetchQuota() : { ok: false, error: 'agy is not installed' };
+  const quota = installed ? (q.ok ? q.verdict : 'unknown') : 'unknown';
+
+  if (json) {
+    console.log(JSON.stringify({
+      agyPath: installed ? which.stdout.trim() : null,
+      installed,
+      quota,
+      groups: q.ok ? q.groups : [],
+      error: q.ok ? null : q.error,
+    }, null, 2));
+    return;
   }
-  const report = { agyPath: installed ? which.stdout.trim() : null, installed, quota };
-  if (json) { console.log(JSON.stringify(report, null, 2)); return; }
-  console.log(`agy installed: ${installed ? report.agyPath : 'NO — install the Antigravity CLI'}`);
+
+  console.log(`agy installed: ${installed ? which.stdout.trim() : 'NO — install the Antigravity CLI'}`);
   console.log(`quota: ${quota}`);
-  if (quota === 'exhausted') console.log('agy is out of quota. Individual quota resets ~every 4-5h. Try again later or use another executor.');
-  if (detail) { console.log('--- ping output ---'); console.log(detail.slice(0, 500)); }
+  if (q.ok) {
+    console.log('');
+    printQuotaTable(q);
+    if (q.verdict === 'exhausted') console.log('\nEvery model group is spent. Wait for the next reset above, or use another executor.');
+    else if (q.verdict === 'partial') console.log('\nOne model group is spent. Pass --model to pick a group that still has room.');
+  } else if (installed) {
+    console.log(`Could not read quota: ${q.error}`);
+  }
 }
 
 // ---- resume-candidate ----------------------------------------------------
@@ -239,10 +350,11 @@ const table = {
   result: cmdResult,
   cancel: cmdCancel,
   setup: cmdSetup,
+  quota: cmdQuota,
   'resume-candidate': cmdResumeCandidate,
 };
 if (!sub || !table[sub]) {
-  console.log('Usage: agy-runtime.mjs <exec|status|result|cancel|setup|resume-candidate> [args]');
+  console.log('Usage: agy-runtime.mjs <exec|status|result|cancel|setup|quota|resume-candidate> [args]');
   process.exit(sub ? 1 : 0);
 }
 table[sub](rest);

@@ -56,18 +56,34 @@ network.
 
 agy can exhaust its quota and then **fail silently**: it prints a line or two of
 preamble, exits 0, and produces near-empty output — looking like "ran but did
-nothing." Check before assigning heavy work:
+nothing."
+
+Do NOT probe this by sending a throwaway prompt: that spends the very quota you
+are measuring. agy has a `/quota` slash command (alias `/usage`), slash commands
+are expanded in print mode, and it costs **zero model tokens**
+(`usage.total_tokens == 0`). It also needs no `--dangerously-skip-permissions`:
 
 ```
-timeout 300 agy --print="Reply one word: ok" --dangerously-skip-permissions
+agy --print="/quota" --output-format json --print-timeout 1m
 ```
 
-Out-of-quota prints `Error: Individual quota reached... Resets in Xh`. Individual
-quota resets roughly every 4-5 hours. `/agy-executor:setup` runs this check.
+The payload lands under `command.data.groups[]`, each with `buckets[]` carrying
+`window` (`weekly` / `5h`), `remaining_fraction` (0..1) and `reset_time` (ISO
+8601). Without `--output-format json` the same data prints as 4-column TSV
+(group, metric, remaining %, reset).
+
+Quota is per model *group*, not global — `Gemini Models` and
+`Claude and GPT models` are spent independently, so one group hitting 0 still
+leaves the other usable via `--model`. Each group has both a weekly limit tied
+to your tier and a rolling 5-hour limit.
+
+`/agy-executor:quota` renders this, `/agy-executor:setup` includes it, and
+`/agy-executor:exec` runs it as a pre-flight and refuses to dispatch when every
+group is spent (bypass with `--no-quota-check`).
 
 ## Failure modes checklist
 
-- Empty/near-empty output on exit 0 → suspect quota exhaustion, not success.
+- Empty/near-empty output on exit 0 → suspect quota exhaustion, not success. Confirm with `/quota`, never with a throwaway prompt.
 - agy explaining a flag instead of doing the task → the prompt was positional.
 - Empty output with a long inline prompt → hand the prompt off via a file.
 - Cannot read the prompt file → its directory was not passed with `--add-dir`.
@@ -76,5 +92,6 @@ quota resets roughly every 4-5 hours. `/agy-executor:setup` runs this check.
 
 `/agy-executor:exec` (or the `agy-runner` subagent) builds all of the above
 automatically. Prefer them over hand-typing agy. Use `/agy-executor:status`,
-`:result`, and `:cancel` to manage background jobs, and `/agy-executor:setup` to
-verify install + quota first.
+`:result`, and `:cancel` to manage background jobs, `/agy-executor:quota` to read
+remaining quota and reset times, and `/agy-executor:setup` to verify install +
+quota first.
